@@ -155,7 +155,8 @@
 
         const displayResults = (finalNetWorth) => {
             const finalNetWorthText = `$${Math.round(finalNetWorth).toLocaleString()}`;
-            const initialTotalNetWorth = parseFloat(state.initialNetWorth) + parseFloat(state.initialBoatValue) + parseFloat(state.initialEmergencyFund);
+            // Initial total net worth should subtract initial loan liability
+            const initialTotalNetWorth = parseFloat(state.initialNetWorth) + parseFloat(state.initialBoatValue) + parseFloat(state.initialEmergencyFund) - (parseFloat(state.boatLoan) || 0);
             const sustainability = finalNetWorth > initialTotalNetWorth ? "The plan is likely sustainable and growing." : "The plan will eventually run out of funds.";
             
             updateStatus(`Final Total Net Worth after ${state.simulationYears} years: ${finalNetWorthText}. ${sustainability}`, finalNetWorth > initialTotalNetWorth ? 'info' : 'error');
@@ -341,7 +342,8 @@
                     netWorth: nw,
                     emergencyFund: emergencyFund,
                     boatValue: boatValue,
-                    totalNetWorth: nw + boatValue + emergencyFund,
+                    // Total net worth = assets minus liabilities (subtract outstanding loan)
+                    totalNetWorth: nw + boatValue + emergencyFund - loanBalance,
                     phase: currentPhase,
                     monthlyNetCashFlow: monthlyNetCashFlowForYear,
                     loanBalance: loanBalance
@@ -350,7 +352,8 @@
 
             populateTable(simulationData);
             populateCapExTable();
-            displayResults(nw + boatValue + emergencyFund);
+            // Pass final net worth after subtracting remaining loan balance
+            displayResults(nw + boatValue + emergencyFund - loanBalance);
         };
 
         // Local persistence: save/load state to localStorage. Keyed by appId and userId.
