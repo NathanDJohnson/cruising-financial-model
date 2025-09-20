@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cruising Financial Model</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .table-container {
+            max-height: 800px;
+            overflow-y: auto;
+            border-radius: 0.5rem;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        thead th {
+            position: sticky;
+            top: 0;
+            background-color: #f3f4f6;
+            z-index: 10;
+        }
+    </style>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Firebase global variables are provided by the Canvas environment.
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId;
+
+        const state = {
+            initialNetWorth: 220000,
+            initialEmergencyFund: 10000,
+            initialBoatValue: 59900,
+            boatLoan: 59900,
+            monthlyLoanPayment: 59900,
+            annualReturn: 7.0,
+            inflationRate: 3.0,
+            longTermCapitalGainsTaxRate: 15.0,
+            phase1Duration: 18,
+            phase1MonthlyIncome: 2500,
+            phase1MonthlyExpenses: 3000,
+            phase1RefitCost: 10000,
+            phase2Duration: 6,
+            phase2FixedExpenses: 500,
+            phase2VariableExpenses: 1000,
+            phase2MaintenanceFund: 250,
+            phase3MinIncome: 1000,
+            phase3MaxIncome: 1500,
+            phase3FixedExpenses: 500,
+            phase3VariableExpenses: 1000,
+            phase3MaintenanceFund: 250,
+            simulationYears: 30,
+            capitalExpenditures: [
+                { item: 'New sails', cost: 15000, year: 10 },
+                { item: 'Standing rigging replacement', cost: 10000, year: 15 },
+                { item: 'New electronics suite', cost: 8000, year: 17 },
+                { item: 'Engine replacement', cost: 20000, year: 20 },
+                { item: 'New sails', cost: 15000, year: 20 },
+                { item: 'Battery bank replacement', cost: 5000, year: 25 }
+            ]
+        };
+        
+        const initialEmergencyFundAmount = state.initialEmergencyFund;
+
+        const elements = {};
+        const statusDiv = document.getElementById('status-message');
+        const resultsTableBody = document.getElementById('resultsTableBody');
+        const capExTableBody = document.getElementById('capExTableBody');
+        const addCapExBtn = document.getElementById('addCapEx');
+
+        const updateStatus = (message, type = 'info') => {
+            statusDiv.textContent = message;
+            statusDiv.className = `p-4 rounded-lg mt-4 text-center ${type === 'error' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}`;
+        };
+        
+        const formatCurrency = (amount) => `$${Math.round(amount).toLocaleString()}`;
+
+        const populateTable = (data) => {
+            resultsTableBody.innerHTML = '';
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.className = 'border-b border-gray-200 hover:bg-gray-100';
+                
+                const cells = [
+                    row.year,
+                    formatCurrency(row.totalNetWorth),
+                    formatCurrency(row.netWorth),
+                    formatCurrency(row.emergencyFund),
+                    formatCurrency(row.boatValue),
+                    row.phase,
+                    formatCurrency(row.monthlyNetCashFlow),
+                    formatCurrency(row.loanBalance)
+                ];
+
+                cells.forEach((text, index) => {
+                    const td = document.createElement('td');
+                    td.textContent = text;
+                    td.className = `p-3 whitespace-nowrap text-sm ${index > 0 ? 'text-right' : 'text-left'}`;
+                    tr.appendChild(td);
+                });
+                resultsTableBody.appendChild(tr);
+            });
+        };
+
+        const populateCapExTable = () => {
+            capExTableBody.innerHTML = '';
+            state.capitalExpenditures.forEach((item, index) => {
+                const tr = document.createElement('tr');
+                tr.className = 'border-b border-gray-200';
+                tr.innerHTML = `
+                    <td class="p-3 text-sm">${item.item}</td>
+                    <td class="p-3 text-sm text-right">$${item.cost.toLocaleString()}</td>
+                    <td class="p-3 text-sm text-center">${item.year}</td>
+                    <td class="p-3 text-sm text-center">
+                        <button class="text-red-500 hover:text-red-700" onclick="deleteCapEx(${index})">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 102 0v6a1 1 0 10-2 0V8zm6 0a1 1 0 102 0v6a1 1 0 10-2 0V8z" clip-rule="evenodd" />
+                            </svg>
+                        </button>
+                    </td>
+                `;
+                capExTableBody.appendChild(tr);
+            });
+        };
+
+        window.deleteCapEx = (index) => {
+            state.capitalExpenditures.splice(index, 1);
+            runSimulation();
+            saveToFirestore();
+        };
+
+        const addCapitalExpenditure = () => {
+            const item = document.getElementById('capExItem').value.trim();
+            const cost = parseFloat(document.getElementById('capExCost').value);
+            const year = parseInt(document.getElementById('capExYear').value, 10);
+
+            if (item && !isNaN(cost) && !isNaN(year) && cost > 0 && year >= 1) {
+                state.capitalExpenditures.push({ item, cost, year });
+                runSimulation();
+                saveToFirestore();
+                document.getElementById('capExItem').value = '';
+                document.getElementById('capExCost').value = '';
+                document.getElementById('capExYear').value = '';
+            }
+        };
+
+        const displayResults = (finalNetWorth) => {
+            const finalNetWorthText = `$${Math.round(finalNetWorth).toLocaleString()}`;
+            const initialTotalNetWorth = parseFloat(state.initialNetWorth) + parseFloat(state.initialBoatValue) + parseFloat(state.initialEmergencyFund);
+            const sustainability = finalNetWorth > initialTotalNetWorth ? "The plan is likely sustainable and growing." : "The plan will eventually run out of funds.";
+            
+            updateStatus(`Final Total Net Worth after ${state.simulationYears} years: ${finalNetWorthText}. ${sustainability}`, finalNetWorth > initialTotalNetWorth ? 'info' : 'error');
+        };
+        
+        const calculateTaxes = (grossIncome) => {
+            let tax = 0;
+            let remainingIncome = grossIncome;
+            const bracket1 = 20000;
+            const bracket2 = 60000;
+
+            if (remainingIncome > bracket2) {
+                tax += (remainingIncome - bracket2) * 0.30;
+                remainingIncome = bracket2;
+            }
+            if (remainingIncome > bracket1) {
+                tax += (remainingIncome - bracket1) * 0.20;
+                remainingIncome = bracket1;
+            }
+            return tax;
+        };
+
+        const runSimulation = () => {
+            let nw = parseFloat(state.initialNetWorth);
+            let emergencyFund = parseFloat(state.initialEmergencyFund);
+            const initialEmergencyFundValue = emergencyFund;
+            let boatValue = parseFloat(state.initialBoatValue);
+            let loanBalance = parseFloat(state.boatLoan);
+            let currentMonth = 0;
+            const simulationData = [];
+
+            let p1Expenses = parseFloat(state.phase1MonthlyExpenses);
+            let p2Fixed = parseFloat(state.phase2FixedExpenses);
+            let p2Variable = parseFloat(state.phase2VariableExpenses);
+            let p2Maintenance = parseFloat(state.phase2MaintenanceFund);
+            let p3MinIncome = parseFloat(state.phase3MinIncome);
+            let p3MaxIncome = parseFloat(state.phase3MaxIncome);
+            let p3Fixed = parseFloat(state.phase3FixedExpenses);
+            let p3Variable = parseFloat(state.phase3VariableExpenses);
+            let p3Maintenance = parseFloat(state.phase3MaintenanceFund);
+
+            for (let year = 1; year <= state.simulationYears; year++) {
+                let monthlyNetCashFlowForYear = 0;
+                let currentPhase = 0;
+                let initialNetWorthThisYear = nw;
+
+                // Check for planned capital expenditures
+                const yearCapEx = state.capitalExpenditures.find(ce => ce.year === year);
+                if (yearCapEx) {
+                    nw -= yearCapEx.cost;
+                }
+                
+                // Emergency Fund logic: replenish if needed
+                if (emergencyFund < initialEmergencyFundValue && nw > 0) {
+                    const amountToTransfer = Math.min(initialEmergencyFundValue - emergencyFund, nw);
+                    emergencyFund += amountToTransfer;
+                    nw -= amountToTransfer;
+                }
+
+                for (let month = 0; month < 12; month++) {
+                    currentMonth++;
+                    let grossIncome = 0;
+                    let expenses = 0;
+                    let loanPayment = 0;
+                    
+                    if (currentMonth <= state.phase1Duration) {
+                        grossIncome = parseFloat(state.phase1MonthlyIncome);
+                        expenses = p1Expenses;
+                        currentPhase = 1;
+                        if (currentMonth === 1) {
+                            nw -= parseFloat(state.phase1RefitCost);
+                        }
+                    } else if (currentMonth <= parseFloat(state.phase1Duration) + parseFloat(state.phase2Duration)) {
+                        expenses = p2Fixed + p2Variable + p2Maintenance;
+                        currentPhase = 2;
+                    } else {
+                        grossIncome = p3MinIncome + Math.random() * (p3MaxIncome - p3MinIncome);
+                        expenses = p3Fixed + p3Variable + p3Maintenance;
+                        currentPhase = 3;
+                    }
+
+                    if (loanBalance > 0) {
+                        loanPayment = parseFloat(state.monthlyLoanPayment);
+                        loanBalance -= loanPayment;
+                        if (loanBalance < 0) {
+                            loanBalance = 0; // Cap loan balance at zero
+                        }
+                    }
+                    
+                    const taxLiability = calculateTaxes(grossIncome * 12) / 12; // Calculate annual tax and divide by 12 for monthly
+                    let netIncome = grossIncome - taxLiability;
+
+                    let monthlyNetCashFlow = netIncome - expenses - loanPayment;
+                    
+                    // Emergency Fund logic: draw down if net worth is negative
+                    if (nw + monthlyNetCashFlow < 0) {
+                        const shortfall = -(nw + monthlyNetCashFlow);
+                        const amountToDraw = Math.min(shortfall, emergencyFund);
+                        emergencyFund -= amountToDraw;
+                        monthlyNetCashFlow += amountToDraw;
+                    }
+
+                    nw += monthlyNetCashFlow;
+                    
+                    nw *= (1 + (parseFloat(state.annualReturn) / 100 / 12));
+                    monthlyNetCashFlowForYear = monthlyNetCashFlow;
+                }
+
+                // Calculate and apply capital gains tax at the end of the year
+                let yearlyInvestmentGain = nw - initialNetWorthThisYear;
+                if (yearlyInvestmentGain > 0) {
+                    const capitalGainsTax = yearlyInvestmentGain * (parseFloat(state.longTermCapitalGainsTaxRate) / 100);
+                    nw -= capitalGainsTax;
+                }
+                
+                // Inflate expenses at the end of each year
+                p1Expenses *= (1 + (parseFloat(state.inflationRate) / 100));
+                p2Fixed *= (1 + (parseFloat(state.inflationRate) / 100));
+                p2Variable *= (1 + (parseFloat(state.inflationRate) / 100));
+                p2Maintenance *= (1 + (parseFloat(state.inflationRate) / 100));
+                p3MinIncome *= (1 + (parseFloat(state.inflationRate) / 100));
+                p3MaxIncome *= (1 + (parseFloat(state.inflationRate) / 100));
+                p3Fixed *= (1 + (parseFloat(state.inflationRate) / 100));
+                p3Variable *= (1 + (parseFloat(state.inflationRate) / 100));
+                p3Maintenance *= (1 + (parseFloat(state.inflationRate) / 100));
+
+                // Non-linear depreciation curve
+                if (year <= 5) {
+                    boatValue *= (1 - 0.08);
+                } else {
+                    boatValue *= (1 - 0.02);
+                }
+
+                simulationData.push({
+                    year: year,
+                    netWorth: nw,
+                    emergencyFund: emergencyFund,
+                    boatValue: boatValue,
+                    totalNetWorth: nw + boatValue + emergencyFund,
+                    phase: currentPhase,
+                    monthlyNetCashFlow: monthlyNetCashFlowForYear,
+                    loanBalance: loanBalance
+                });
+            }
+
+            populateTable(simulationData);
+            populateCapExTable();
+            displayResults(nw + boatValue + emergencyFund);
+        };
+
+        const saveToFirestore = () => {
+            if (!userId) return;
+            const docRef = doc(db, `artifacts/${appId}/users/${userId}/financial-model`, 'data');
+            const dataToSave = { ...state, capitalExpenditures: JSON.stringify(state.capitalExpenditures) };
+            setDoc(docRef, dataToSave, { merge: true })
+                .then(() => updateStatus('Changes saved!', 'info'))
+                .catch(error => updateStatus(`Save failed: ${error.message}`, 'error'));
+        };
+
+        const loadFromFirestore = () => {
+            if (!userId) {
+                updateStatus('User not authenticated. Using default values.');
+                return;
+            }
+            const docRef = doc(db, `artifacts/${appId}/users/${userId}/financial-model`, 'data');
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    data.capitalExpenditures = JSON.parse(data.capitalExpenditures || '[]');
+                    Object.assign(state, data);
+                }
+                updateUI();
+                runSimulation();
+                updateStatus('Data loaded and updated in real-time.', 'info');
+                
+            }, (error) => {
+                updateStatus(`Error listening for data: ${error.message}`, 'error');
+            });
+        };
+        
+        const updateUI = () => {
+            Object.keys(elements).forEach(key => {
+                const element = elements[key];
+                if (element && typeof state[key] !== 'undefined') {
+                    element.value = state[key];
+                }
+            });
+            populateCapExTable();
+        };
+
+        const setupListeners = () => {
+            const inputNames = [
+                'initialNetWorth', 'initialEmergencyFund', 'initialBoatValue', 'boatLoan', 'monthlyLoanPayment', 'annualReturn', 'inflationRate', 'longTermCapitalGainsTaxRate',
+                'phase1Duration', 'phase1MonthlyIncome', 'phase1MonthlyExpenses', 'phase1RefitCost',
+                'phase2Duration', 'phase2FixedExpenses', 'phase2VariableExpenses', 'phase2MaintenanceFund',
+                'phase3MinIncome', 'phase3MaxIncome', 'phase3FixedExpenses', 'phase3VariableExpenses', 'phase3MaintenanceFund',
+                'simulationYears'
+            ];
+            
+            inputNames.forEach(name => {
+                const element = document.getElementById(name);
+                if (element) {
+                    elements[name] = element;
+                    element.addEventListener('input', (e) => {
+                        state[name] = e.target.value;
+                        runSimulation();
+                        saveToFirestore();
+                    });
+                }
+            });
+
+            if (addCapExBtn) {
+                addCapExBtn.addEventListener('click', addCapitalExpenditure);
+            }
+        };
+        
+        window.onload = () => {
+            const app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
+
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('userIdDisplay').textContent = `User ID: ${userId}`;
+                    setupListeners();
+                    loadFromFirestore();
+                } else {
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        updateStatus(`Authentication failed: ${error.message}`, 'error');
+                        console.error("Auth error:", error);
+                    }
+                }
+            });
+        };
+    </script>
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans p-4 md:p-8">
+    <div class="max-w-7xl mx-auto bg-white rounded-xl shadow-2xl p-6 md:p-12 space-y-8">
+        <header class="text-center space-y-2">
+            <h1 class="text-4xl font-bold text-gray-900">The Cruising Financial Framework</h1>
+            <p class="text-lg text-gray-600">This model is designed around the "golden prompt" for a phased transition to a life at sea, recognizing that a sustainable cruising lifestyle is a marathon, not a sprint.  Plan your journey and ensure your finances can support the dream.</p>
+            <div id="userIdDisplay" class="text-sm font-mono text-gray-400 mt-2">Authenticating...</div>
+        </header>
+
+        <main class="grid lg:grid-cols-2 gap-8">
+            <!-- Left Column: Inputs -->
+            <div class="space-y-6">
+                <section class="bg-gray-50 p-6 rounded-lg shadow-inner">
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Global Assumptions</h2>
+                    <div class="grid md:grid-cols-2 gap-4">
+                        <div>
+                            <label for="initialNetWorth" class="block text-sm font-medium text-gray-700">Initial Cash/Investments ($)</label>
+                            <input type="number" id="initialNetWorth" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="initialEmergencyFund" class="block text-sm font-medium text-gray-700">Dedicated Emergency Fund ($)</label>
+                            <input type="number" id="initialEmergencyFund" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="initialBoatValue" class="block text-sm font-medium text-gray-700">Initial Boat Value ($)</label>
+                            <input type="number" id="initialBoatValue" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="boatLoan" class="block text-sm font-medium text-gray-700">Boat Loan Amount ($)</label>
+                            <input type="number" id="boatLoan" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                         <div>
+                            <label for="monthlyLoanPayment" class="block text-sm font-medium text-gray-700">Monthly Loan Payment ($)</label>
+                            <input type="number" id="monthlyLoanPayment" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="annualReturn" class="block text-sm font-medium text-gray-700">Annual Return on Investments (%)</label>
+                            <input type="number" id="annualReturn" step="0.1" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="longTermCapitalGainsTaxRate" class="block text-sm font-medium text-gray-700">Capital Gains Tax Rate (%)</label>
+                            <input type="number" id="longTermCapitalGainsTaxRate" step="0.1" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="inflationRate" class="block text-sm font-medium text-gray-700">Inflation Rate (%)</label>
+                            <input type="number" id="inflationRate" step="0.1" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="simulationYears" class="block text-sm font-medium text-gray-700">Simulation Years</label>
+                            <input type="number" id="simulationYears" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                    </div>
+                </section>
+
+                <section class="bg-blue-50 p-6 rounded-lg shadow-inner">
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Phase 1: Refit & Work</h2>
+                    <p class="text-sm text-gray-500 mb-4">A period of intense saving and boat preparation while working full-time.</p>
+                    <div class="grid md:grid-cols-2 gap-4">
+                        <div>
+                            <label for="phase1Duration" class="block text-sm font-medium text-gray-700">Duration (Months)</label>
+                            <input type="number" id="phase1Duration" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase1MonthlyIncome" class="block text-sm font-medium text-gray-700">Gross Monthly Income ($)</label>
+                            <input type="number" id="phase1MonthlyIncome" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase1MonthlyExpenses" class="block text-sm font-medium text-gray-700">Monthly Living Expenses ($)</label>
+                            <input type="number" id="phase1MonthlyExpenses" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase1RefitCost" class="block text-sm font-medium text-gray-700">One-Time Refit Cost ($)</label>
+                            <input type="number" id="phase1RefitCost" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                    </div>
+                </section>
+
+                <section class="bg-blue-50 p-6 rounded-lg shadow-inner">
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Phase 2: Short Sabbatical</h2>
+                    <p class="text-sm text-gray-500 mb-4">A period of zero work to test the lifestyle and cruising. </p>
+                    <div class="grid md:grid-cols-2 gap-4">
+                        <div>
+                            <label for="phase2Duration" class="block text-sm font-medium text-gray-700">Duration (Months)</label>
+                            <input type="number" id="phase2Duration" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase2FixedExpenses" class="block text-sm font-medium text-gray-700">Fixed Monthly Expenses ($)</label>
+                            <input type="number" id="phase2FixedExpenses" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase2VariableExpenses" class="block text-sm font-medium text-gray-700">Variable Monthly Expenses ($)</label>
+                            <input type="number" id="phase2VariableExpenses" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase2MaintenanceFund" class="block text-sm font-medium text-gray-700">Maintenance Fund (Monthly) ($)</label>
+                            <input type="number" id="phase2MaintenanceFund" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                    </div>
+                </section>
+                
+                <section class="bg-blue-50 p-6 rounded-lg shadow-inner">
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Phase 3: Semi-Retired Cruising</h2>
+                    <p class="text-sm text-gray-500 mb-4">Your indefinite cruising life, sustained by part-time remote work.</p>
+                    <div class="grid md:grid-cols-2 gap-4">
+                         <div>
+                            <label for="phase3MinIncome" class="block text-sm font-medium text-gray-700">Min Monthly Income ($)</label>
+                            <input type="number" id="phase3MinIncome" step="100" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase3MaxIncome" class="block text-sm font-medium text-gray-700">Max Monthly Income ($)</label>
+                            <input type="number" id="phase3MaxIncome" step="100" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase3FixedExpenses" class="block text-sm font-medium text-gray-700">Fixed Monthly Expenses ($)</label>
+                            <input type="number" id="phase3FixedExpenses" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase3VariableExpenses" class="block text-sm font-medium text-gray-700">Variable Monthly Expenses ($)</label>
+                            <input type="number" id="phase3VariableExpenses" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="phase3MaintenanceFund" class="block text-sm font-medium text-gray-700">Maintenance Fund (Monthly) ($)</label>
+                            <input type="number" id="phase3MaintenanceFund" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                    </div>
+                </section>
+
+                <section class="bg-yellow-50 p-6 rounded-lg shadow-inner">
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Future Capital Expenditures</h2>
+                    <p class="text-sm text-gray-500 mb-4">Plan for major expenses like engine replacement or new sails.</p>
+                    <div class="space-y-4">
+                        <div class="grid grid-cols-3 gap-4">
+                            <div>
+                                <label for="capExItem" class="block text-sm font-medium text-gray-700">Item</label>
+                                <input type="text" id="capExItem" placeholder="e.g., Engine" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                            </div>
+                            <div>
+                                <label for="capExCost" class="block text-sm font-medium text-gray-700">Cost ($)</label>
+                                <input type="number" id="capExCost" placeholder="e.g., 15000" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                            </div>
+                            <div>
+                                <label for="capExYear" class="block text-sm font-medium text-gray-700">Year</label>
+                                <input type="number" id="capExYear" placeholder="e.g., 12" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                            </div>
+                        </div>
+                        <button id="addCapEx" class="w-full bg-yellow-400 text-yellow-900 py-2 rounded-md font-semibold hover:bg-yellow-500 transition-colors">Add Expenditure</button>
+                    </div>
+                    <div class="mt-6 table-container max-h-48">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
+                                    <th class="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Cost</th>
+                                    <th class="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Year</th>
+                                    <th class="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Remove</th>
+                                </tr>
+                            </thead>
+                            <tbody id="capExTableBody" class="bg-white divide-y divide-gray-200">
+                                <!-- CapEx rows will be populated by JavaScript -->
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Right Column: Results Table -->
+            <div class="space-y-6">
+                <h2 class="text-2xl font-semibold text-gray-800 mb-4 text-center">Yearly Simulation Results</h2>
+                <div class="table-container bg-white rounded-lg shadow-lg">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th scope="col" class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Year</th>
+                                <th scope="col" class="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Total NW</th>
+                                <th scope="col" class="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Cash/Inv.</th>
+                                <th scope="col" class="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Emerg. Fund</th>
+                                <th scope="col" class="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Boat Value</th>
+                                <th scope="col" class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Phase</th>
+                                <th scope="col" class="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Monthly Cash Flow</th>
+                                <th scope="col" scope="col" class="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Loan Balance</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsTableBody" class="bg-white divide-y divide-gray-200">
+                            <!-- Table rows will be populated by JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+        
+        <div id="status-message" class="p-4 rounded-lg text-center mt-4">Initializing application...</div>
+    </div>
+</body>
+</html>
