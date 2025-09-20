@@ -29,8 +29,8 @@
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-        // Simple local user identifier and persistence keying
-        let userId = null;
+    // Simple local user identifier and persistence keying
+    let userId = null;
 
         const state = {
             initialNetWorth: 220000,
@@ -55,6 +55,10 @@
             phase3VariableExpenses: 1000,
             phase3MaintenanceFund: 250,
             simulationYears: 30,
+            // New parameters for improved modeling
+            loanInterestRate: 5.0, // annual interest rate (%) for the boat loan
+            capitalGainsRealizationRate: 1.0, // fraction of paper gains realized each year (1.0 = 100% realized, 0 = never realized)
+            randomSeed: null, // if set, makes phase3 income deterministic per user
             capitalExpenditures: [
                 { item: 'New sails', cost: 15000, year: 10 },
                 { item: 'Standing rigging replacement', cost: 10000, year: 15 },
@@ -65,8 +69,6 @@
             ]
         };
         
-        const initialEmergencyFundAmount = state.initialEmergencyFund;
-
         const elements = {};
         const statusDiv = document.getElementById('status-message');
         const resultsTableBody = document.getElementById('resultsTableBody');
@@ -80,7 +82,7 @@
         
         const formatCurrency = (amount) => `$${Math.round(amount).toLocaleString()}`;
 
-        const populateTable = (data) => {
+    const populateTable = (data) => {
             resultsTableBody.innerHTML = '';
             data.forEach(row => {
                 const tr = document.createElement('tr');
@@ -131,7 +133,7 @@
         window.deleteCapEx = (index) => {
             state.capitalExpenditures.splice(index, 1);
             runSimulation();
-            saveToFirestore();
+            saveToLocalStorage();
         };
 
         const addCapitalExpenditure = () => {
@@ -142,7 +144,7 @@
             if (item && !isNaN(cost) && !isNaN(year) && cost > 0 && year >= 1) {
                 state.capitalExpenditures.push({ item, cost, year });
                 runSimulation();
-                saveToFirestore();
+                saveToLocalStorage();
                 document.getElementById('capExItem').value = '';
                 document.getElementById('capExCost').value = '';
                 document.getElementById('capExYear').value = '';
@@ -174,6 +176,17 @@
             return tax;
         };
 
+        // Simple deterministic RNG (mulberry32) seeded per user for reproducible Phase 3 income
+        const createSeededRng = (seed) => {
+            let t = seed >>> 0;
+            return function() {
+                t += 0x6D2B79F5;
+                let r = Math.imul(t ^ t >>> 15, 1 | t);
+                r = (r + Math.imul(r ^ r >>> 7, 61 | r)) ^ r;
+                return ((r ^ r >>> 14) >>> 0) / 4294967296;
+            };
+        };
+
         const runSimulation = () => {
             let nw = parseFloat(state.initialNetWorth);
             let emergencyFund = parseFloat(state.initialEmergencyFund);
@@ -193,22 +206,28 @@
             let p3Variable = parseFloat(state.phase3VariableExpenses);
             let p3Maintenance = parseFloat(state.phase3MaintenanceFund);
 
-            for (let year = 1; year <= state.simulationYears; year++) {
+            // prepare RNG for Phase 3 income
+            let rng = Math.random;
+            if (state.randomSeed) {
+                rng = createSeededRng(Number(state.randomSeed));
+            } else if (userId) {
+                // derive a seed from userId for deterministic results per user
+                let seed = 0;
+                for (let i = 0; i < userId.length; i++) seed = ((seed << 5) - seed) + userId.charCodeAt(i);
+                rng = createSeededRng(seed >>> 0);
+            }
+
+            for (let year = 1; year <= Number(state.simulationYears); year++) {
                 let monthlyNetCashFlowForYear = 0;
+                let sumMonthlyNetCashFlow = 0;
                 let currentPhase = 0;
                 let initialNetWorthThisYear = nw;
-
-                // Check for planned capital expenditures
-                const yearCapEx = state.capitalExpenditures.find(ce => ce.year === year);
-                if (yearCapEx) {
-                    nw -= yearCapEx.cost;
-                }
-                
-                // Emergency Fund logic: replenish if needed
-                if (emergencyFund < initialEmergencyFundValue && nw > 0) {
-                    const amountToTransfer = Math.min(initialEmergencyFundValue - emergencyFund, nw);
-                    emergencyFund += amountToTransfer;
-                    nw -= amountToTransfer;
+                // Check for planned capital expenditures: aggregate all capex for the year
+                const yearCapExTotal = state.capitalExpenditures
+                    .filter(ce => Number(ce.year) === year)
+                    .reduce((s, ce) => s + (Number(ce.cost) || 0), 0);
+                if (yearCapExTotal) {
+                    nw -= yearCapExTotal;
                 }
 
                 for (let month = 0; month < 12; month++) {
@@ -216,6 +235,8 @@
                     let grossIncome = 0;
                     let expenses = 0;
                     let loanPayment = 0;
+                    let loanInterestExpense = 0;
+                    let loanPrincipalPayment = 0;
                     
                     if (currentMonth <= state.phase1Duration) {
                         grossIncome = parseFloat(state.phase1MonthlyIncome);
@@ -234,11 +255,16 @@
                     }
 
                     if (loanBalance > 0) {
-                        loanPayment = parseFloat(state.monthlyLoanPayment);
-                        loanBalance -= loanPayment;
-                        if (loanBalance < 0) {
-                            loanBalance = 0; // Cap loan balance at zero
-                        }
+                        const monthlyInterestRate = (parseFloat(state.loanInterestRate) || 0) / 100 / 12;
+                        const requestedPayment = parseFloat(state.monthlyLoanPayment) || 0;
+                        // interest for this month
+                        loanInterestExpense = loanBalance * monthlyInterestRate;
+                        // full due this month is interest + principal
+                        const maxAllowedPayment = loanBalance + loanInterestExpense;
+                        const actualPayment = Math.min(requestedPayment, maxAllowedPayment);
+                        loanPrincipalPayment = Math.max(0, actualPayment - loanInterestExpense);
+                        loanBalance = Math.max(0, loanBalance - loanPrincipalPayment);
+                        loanPayment = actualPayment; // cash outflow for loan
                     }
                     
                     const taxLiability = calculateTaxes(grossIncome * 12) / 12; // Calculate annual tax and divide by 12 for monthly
@@ -253,17 +279,28 @@
                         emergencyFund -= amountToDraw;
                         monthlyNetCashFlow += amountToDraw;
                     }
-
+                    // Monthly emergency-fund replenishment if surplus cash (do not deplete below zero)
+                    // If emergency fund is below target, move available surplus to emergency fund (up to target) after positive cash flow
                     nw += monthlyNetCashFlow;
-                    
+                    if (emergencyFund < initialEmergencyFundValue && nw > 0) {
+                        const amountToTransfer = Math.min(initialEmergencyFundValue - emergencyFund, nw);
+                        emergencyFund += amountToTransfer;
+                        nw -= amountToTransfer;
+                    }
+
+                    // Monthly return applied to investable net worth
                     nw *= (1 + (parseFloat(state.annualReturn) / 100 / 12));
-                    monthlyNetCashFlowForYear = monthlyNetCashFlow;
+
+                    sumMonthlyNetCashFlow += monthlyNetCashFlow;
+                    monthlyNetCashFlowForYear = sumMonthlyNetCashFlow / 12; // average monthly cash flow for the year
                 }
 
-                // Calculate and apply capital gains tax at the end of the year
+                // Calculate and apply capital gains tax at the end of the year on realized portion only
                 let yearlyInvestmentGain = nw - initialNetWorthThisYear;
-                if (yearlyInvestmentGain > 0) {
-                    const capitalGainsTax = yearlyInvestmentGain * (parseFloat(state.longTermCapitalGainsTaxRate) / 100);
+                const realizationRate = Math.max(0, Math.min(1, Number(state.capitalGainsRealizationRate) || 0));
+                if (yearlyInvestmentGain > 0 && realizationRate > 0) {
+                    const realizedGain = yearlyInvestmentGain * realizationRate;
+                    const capitalGainsTax = realizedGain * (parseFloat(state.longTermCapitalGainsTaxRate) / 100);
                     nw -= capitalGainsTax;
                 }
                 
@@ -305,13 +342,12 @@
         // Local persistence: save/load state to localStorage. Keyed by appId and userId.
         const persistenceKeyForUser = (id) => `artifacts/${appId}/users/${id}/financial-model`;
 
-        const saveToFirestore = () => {
+        const saveToLocalStorage = () => {
             if (!userId) return;
             try {
                 const key = persistenceKeyForUser(userId);
-                // Make a shallow copy suitable for storage
-                const dataToSave = { ...state };
-                // Ensure capitalExpenditures is serializable (it already is)
+                // Make a shallow copy suitable for storage and add metadata
+                const dataToSave = { ...state, _meta: { lastSaved: new Date().toISOString() } };
                 localStorage.setItem(key, JSON.stringify(dataToSave));
                 // Notify other listeners (storage event won't fire in same tab), so dispatch custom event
                 window.dispatchEvent(new Event('financial-model-updated'));
@@ -321,7 +357,7 @@
             }
         };
 
-        const loadFromFirestore = () => {
+        const loadFromLocalStorage = () => {
             if (!userId) {
                 updateStatus('User not authenticated. Using default values.');
                 return;
@@ -335,12 +371,18 @@
                     if (typeof data.capitalExpenditures === 'string') {
                         try { data.capitalExpenditures = JSON.parse(data.capitalExpenditures); } catch(e) { data.capitalExpenditures = []; }
                     }
-                    if (Array.isArray(data.capitalExpenditures)) {
-                        // ok
-                    } else {
+                    if (!Array.isArray(data.capitalExpenditures)) {
                         data.capitalExpenditures = data.capitalExpenditures || [];
                     }
-                    Object.assign(state, data);
+                    // Normalize capex entries
+                    data.capitalExpenditures = data.capitalExpenditures.map(ce => ({
+                        item: ce.item || '',
+                        cost: Number(ce.cost) || 0,
+                        year: parseInt(ce.year, 10) || 0
+                    }));
+                    // Remove meta before merging
+                    const { _meta, ...rest } = data;
+                    Object.assign(state, rest);
                 }
                 updateUI();
                 runSimulation();
@@ -355,12 +397,12 @@
             if (!userId) return;
             const expectedKey = persistenceKeyForUser(userId);
             if (e.key === expectedKey) {
-                loadFromFirestore();
+                    loadFromLocalStorage();
             }
         });
         window.addEventListener('financial-model-updated', () => {
             // Reload from local copy after save in same tab
-            loadFromFirestore();
+            loadFromLocalStorage();
         });
         
         const updateUI = () => {
@@ -389,7 +431,7 @@
                     element.addEventListener('input', (e) => {
                         state[name] = e.target.value;
                         runSimulation();
-                        saveToFirestore();
+                        saveToLocalStorage();
                     });
                 }
             });
@@ -415,7 +457,7 @@
 
             document.getElementById('userIdDisplay').textContent = `User ID: ${userId}`;
             setupListeners();
-            loadFromFirestore();
+            loadFromLocalStorage();
         };
     </script>
 </head>
