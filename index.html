@@ -74,6 +74,8 @@
         const resultsTableBody = document.getElementById('resultsTableBody');
         const capExTableBody = document.getElementById('capExTableBody');
         const addCapExBtn = document.getElementById('addCapEx');
+        // Warning flag to avoid spamming UI for negative amortization
+        let negativeAmortizationWarned = false;
 
         const updateStatus = (message, type = 'info') => {
             statusDiv.textContent = message;
@@ -259,12 +261,24 @@
                         const requestedPayment = parseFloat(state.monthlyLoanPayment) || 0;
                         // interest for this month
                         loanInterestExpense = loanBalance * monthlyInterestRate;
-                        // full due this month is interest + principal
+                        // full due this month is interest + principal (can't pay more than that)
                         const maxAllowedPayment = loanBalance + loanInterestExpense;
                         const actualPayment = Math.min(requestedPayment, maxAllowedPayment);
-                        loanPrincipalPayment = Math.max(0, actualPayment - loanInterestExpense);
-                        loanBalance = Math.max(0, loanBalance - loanPrincipalPayment);
-                        loanPayment = actualPayment; // cash outflow for loan
+                        if (actualPayment < loanInterestExpense) {
+                            // Payment doesn't even cover interest -> unpaid interest capitalizes (negative amortization)
+                            const unpaidInterest = loanInterestExpense - actualPayment;
+                            loanBalance = loanBalance + unpaidInterest; // capitalize unpaid interest
+                            loanPrincipalPayment = 0;
+                            loanPayment = actualPayment;
+                            if (!negativeAmortizationWarned) {
+                                updateStatus('Warning: monthly loan payment does not cover interest; unpaid interest will be capitalized, increasing loan balance.', 'error');
+                                negativeAmortizationWarned = true;
+                            }
+                        } else {
+                            loanPrincipalPayment = Math.max(0, actualPayment - loanInterestExpense);
+                            loanBalance = Math.max(0, loanBalance - loanPrincipalPayment);
+                            loanPayment = actualPayment; // cash outflow for loan
+                        }
                     }
                     
                     const taxLiability = calculateTaxes(grossIncome * 12) / 12; // Calculate annual tax and divide by 12 for monthly
@@ -417,7 +431,7 @@
 
         const setupListeners = () => {
             const inputNames = [
-                'initialNetWorth', 'initialEmergencyFund', 'initialBoatValue', 'boatLoan', 'monthlyLoanPayment', 'annualReturn', 'inflationRate', 'longTermCapitalGainsTaxRate',
+                'initialNetWorth', 'initialEmergencyFund', 'initialBoatValue', 'boatLoan', 'monthlyLoanPayment', 'loanInterestRate', 'annualReturn', 'inflationRate', 'longTermCapitalGainsTaxRate',
                 'phase1Duration', 'phase1MonthlyIncome', 'phase1MonthlyExpenses', 'phase1RefitCost',
                 'phase2Duration', 'phase2FixedExpenses', 'phase2VariableExpenses', 'phase2MaintenanceFund',
                 'phase3MinIncome', 'phase3MaxIncome', 'phase3FixedExpenses', 'phase3VariableExpenses', 'phase3MaintenanceFund',
@@ -429,7 +443,9 @@
                 if (element) {
                     elements[name] = element;
                     element.addEventListener('input', (e) => {
-                        state[name] = e.target.value;
+                        // coerce numeric inputs to numbers where appropriate
+                        const val = e.target.value;
+                        state[name] = val;
                         runSimulation();
                         saveToLocalStorage();
                     });
@@ -494,6 +510,10 @@
                          <div>
                             <label for="monthlyLoanPayment" class="block text-sm font-medium text-gray-700">Monthly Loan Payment ($)</label>
                             <input type="number" id="monthlyLoanPayment" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2">
+                        </div>
+                        <div>
+                            <label for="loanInterestRate" class="block text-sm font-medium text-gray-700">Loan Interest Rate (%)</label>
+                            <input type="number" id="loanInterestRate" step="0.01" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value="5.0">
                         </div>
                         <div>
                             <label for="annualReturn" class="block text-sm font-medium text-gray-700">Annual Return on Investments (%)</label>
