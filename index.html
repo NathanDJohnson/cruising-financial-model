@@ -23,18 +23,14 @@
         }
     </style>
     <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        
-        // Firebase global variables are provided by the Canvas environment.
+        // Replaced Firebase with a localStorage-based persistence layer.
+        // This preserves all app functionality (anonymous auth -> stable userId, save/load, and cross-tab updates)
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-        let db;
-        let auth;
-        let userId;
+        // Simple local user identifier and persistence keying
+        let userId = null;
 
         const state = {
             initialNetWorth: 220000,
@@ -306,13 +302,23 @@
             displayResults(nw + boatValue + emergencyFund);
         };
 
+        // Local persistence: save/load state to localStorage. Keyed by appId and userId.
+        const persistenceKeyForUser = (id) => `artifacts/${appId}/users/${id}/financial-model`;
+
         const saveToFirestore = () => {
             if (!userId) return;
-            const docRef = doc(db, `artifacts/${appId}/users/${userId}/financial-model`, 'data');
-            const dataToSave = { ...state, capitalExpenditures: JSON.stringify(state.capitalExpenditures) };
-            setDoc(docRef, dataToSave, { merge: true })
-                .then(() => updateStatus('Changes saved!', 'info'))
-                .catch(error => updateStatus(`Save failed: ${error.message}`, 'error'));
+            try {
+                const key = persistenceKeyForUser(userId);
+                // Make a shallow copy suitable for storage
+                const dataToSave = { ...state };
+                // Ensure capitalExpenditures is serializable (it already is)
+                localStorage.setItem(key, JSON.stringify(dataToSave));
+                // Notify other listeners (storage event won't fire in same tab), so dispatch custom event
+                window.dispatchEvent(new Event('financial-model-updated'));
+                updateStatus('Changes saved!', 'info');
+            } catch (error) {
+                updateStatus(`Save failed: ${error.message}`, 'error');
+            }
         };
 
         const loadFromFirestore = () => {
@@ -320,21 +326,42 @@
                 updateStatus('User not authenticated. Using default values.');
                 return;
             }
-            const docRef = doc(db, `artifacts/${appId}/users/${userId}/financial-model`, 'data');
-            onSnapshot(docRef, (docSnap) => {
-                if (docSnap.exists()) {
-                    const data = docSnap.data();
-                    data.capitalExpenditures = JSON.parse(data.capitalExpenditures || '[]');
+            try {
+                const key = persistenceKeyForUser(userId);
+                const raw = localStorage.getItem(key);
+                if (raw) {
+                    const data = JSON.parse(raw);
+                    // Backwards compatibility: if capex stored as string
+                    if (typeof data.capitalExpenditures === 'string') {
+                        try { data.capitalExpenditures = JSON.parse(data.capitalExpenditures); } catch(e) { data.capitalExpenditures = []; }
+                    }
+                    if (Array.isArray(data.capitalExpenditures)) {
+                        // ok
+                    } else {
+                        data.capitalExpenditures = data.capitalExpenditures || [];
+                    }
                     Object.assign(state, data);
                 }
                 updateUI();
                 runSimulation();
-                updateStatus('Data loaded and updated in real-time.', 'info');
-                
-            }, (error) => {
-                updateStatus(`Error listening for data: ${error.message}`, 'error');
-            });
+                updateStatus('Data loaded and updated (local).', 'info');
+            } catch (error) {
+                updateStatus(`Error loading data: ${error.message}`, 'error');
+            }
         };
+
+        // Listen for storage changes from other tabs and custom in-tab events
+        window.addEventListener('storage', (e) => {
+            if (!userId) return;
+            const expectedKey = persistenceKeyForUser(userId);
+            if (e.key === expectedKey) {
+                loadFromFirestore();
+            }
+        });
+        window.addEventListener('financial-model-updated', () => {
+            // Reload from local copy after save in same tab
+            loadFromFirestore();
+        });
         
         const updateUI = () => {
             Object.keys(elements).forEach(key => {
@@ -373,29 +400,22 @@
         };
         
         window.onload = () => {
-            const app = initializeApp(firebaseConfig);
-            auth = getAuth(app);
-            db = getFirestore(app);
-
-            onAuthStateChanged(auth, async (user) => {
-                if (user) {
-                    userId = user.uid;
-                    document.getElementById('userIdDisplay').textContent = `User ID: ${userId}`;
-                    setupListeners();
-                    loadFromFirestore();
+            // Simple local anonymous "auth": create or reuse a stable userId stored in localStorage.
+            const localUserKey = `cruising-financial-model:userId:${appId}`;
+            userId = localStorage.getItem(localUserKey);
+            if (!userId) {
+                // Try to use provided token as stable id if present
+                if (initialAuthToken) {
+                    userId = `token-${initialAuthToken.slice(0,8)}`;
                 } else {
-                    try {
-                        if (initialAuthToken) {
-                            await signInWithCustomToken(auth, initialAuthToken);
-                        } else {
-                            await signInAnonymously(auth);
-                        }
-                    } catch (error) {
-                        updateStatus(`Authentication failed: ${error.message}`, 'error');
-                        console.error("Auth error:", error);
-                    }
+                    userId = `anon-${Math.random().toString(36).slice(2,10)}`;
                 }
-            });
+                localStorage.setItem(localUserKey, userId);
+            }
+
+            document.getElementById('userIdDisplay').textContent = `User ID: ${userId}`;
+            setupListeners();
+            loadFromFirestore();
         };
     </script>
 </head>
